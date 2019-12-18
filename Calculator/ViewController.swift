@@ -18,12 +18,15 @@ class ViewController: UIViewController {
     
     var buttons = [[UIButton]]()
     let buttonTitles = [
-        ["AC", "+/-", "%", "÷"],
+        ["AC", "(", ")", "÷"],
         ["7", "8", "9", "×"],
         ["4", "5", "6", "-"],
         ["1", "2", "3", "+"],
-        ["0", ".", "="]
+        ["0", ".", "⌫", "="]
     ]
+    
+    var requestIsBeingMade = false
+    var requestWasJustMade = false
     
     // MARK: - UIViewController Life Cycle Functions
     
@@ -42,7 +45,7 @@ class ViewController: UIViewController {
     
 }
 
-// MARK: - Extension: Setup Functions
+// MARK: - Extension: UI Setup Functions
 
 extension ViewController {
     
@@ -74,11 +77,19 @@ extension ViewController {
                 button.titleLabel?.adjustsFontSizeToFitWidth = true
                 if outer == 0 && inner < 3 {
                     // Handles the edge case for the 3 top left buttons ("AC", "+/-", "%")
-                    button.setTitleColor(.black, for: .normal)
-                    button.backgroundColor = .white
+                    button.setTitleColor((inner == 0) ? .white : .black, for: .normal)
+                    button.backgroundColor = (inner == 0) ? .blue : .white
                 } else {
                     button.setTitleColor(.white, for: .normal)
-                    button.backgroundColor = (inner + 1 == buttonTitles[outer].count) ? .orange : .gray
+                    if outer == 4 && inner == 2 {
+                        // Handles the edge case for "⌫"
+                        button.backgroundColor = .red
+                    } else if outer == 4 && inner == 3 {
+                        // Handles the edge case for "="
+                        button.backgroundColor = UIColor(red: 0, green: 0.5, blue: 0, alpha: 1)
+                    } else {
+                        button.backgroundColor = (inner + 1 == buttonTitles[outer].count) ? .orange : .gray
+                    }
                 }
                 button.addTarget(self, action: #selector(buttonTapped(sender:)), for: .touchUpInside)
                 buttons[outer].append(button)
@@ -92,18 +103,8 @@ extension ViewController {
             subStackView.axis = .horizontal
             subStackView.distribution = .fillEqually
             subStackView.spacing = 10
-            if index < 4 {
-                for button in buttons[index] {
-                    subStackView.addArrangedSubview(button)
-                }
-            } else {
-                // Handles the edge case for the last row ("0", ".", "="), since it only has 3 buttons
-                subStackView.addArrangedSubview(buttons[index][0])
-                let subsubStackView = UIStackView(arrangedSubviews: [buttons[index][1], buttons[index][2]])
-                subsubStackView.axis = .horizontal
-                subsubStackView.distribution = .fillEqually
-                subsubStackView.spacing = 10
-                subStackView.addArrangedSubview(subsubStackView)
+            for button in buttons[index] {
+                subStackView.addArrangedSubview(button)
             }
             mainStackView.addArrangedSubview(subStackView)
         }
@@ -139,20 +140,133 @@ extension ViewController {
     
 }
 
-// MARK: - Objective-C Exposed Functions
+// MARK: - Extension: Objective-C Exposed Functions
 
 extension ViewController {
     
     @objc func buttonTapped(sender: UIButton!) {
+        if requestIsBeingMade {
+            return
+        }
+        
         guard let buttonTitle = sender.titleLabel?.text else {
             return
         }
-        if buttonTitle == "AC" {
-            resultLabel.text = "0"
+        guard var currentExpression = resultLabel.text else {
             return
         }
-        let previousText = (resultLabel.text == "0") ? "" : (resultLabel.text ?? "")
-        resultLabel.text = previousText + buttonTitle
+        
+        switch buttonTitle {
+        case "=":
+            if requestWasJustMade {
+                return
+            }
+            getResult(of: currentExpression)
+        case "AC":
+            resultLabel.text = "0"
+        case "⌫":
+            let start = currentExpression.startIndex
+            let end = currentExpression.endIndex
+            let endMinusOne = currentExpression.index(end, offsetBy: -1)
+            let trimmedString = String(currentExpression[start..<endMinusOne])
+            resultLabel.text = (trimmedString.isEmpty) ? "0" : trimmedString
+        default:
+            if (currentExpression == "0" && buttonTitle != ".") || (requestWasJustMade && !isOperator(buttonTitle)) {
+                currentExpression = ""
+            }
+            resultLabel.text = currentExpression + buttonTitle
+        }
+        
+        requestWasJustMade = false
+    }
+    
+}
+
+// MARK: - Extension: Network Request Function
+
+extension ViewController {
+    
+    func getResult(of expression: String) {
+        requestIsBeingMade = true
+        
+        let methodParameters: [String: Any] = [
+            "expr": expression.replacingOccurrences(of: "×", with: "*").replacingOccurrences(of: "÷", with: "/"),
+            "precision": 10
+        ]
+        guard let requestURL = mathjsURL(from: methodParameters) else {
+            displayErrorAlert(debugMessage: "The requestURL was not able to be generated.")
+            return
+        }
+        
+        // Make request to the math.js API (https://api.mathjs.org/)
+        let task = URLSession.shared.dataTask(with: requestURL) { (data, response, error) in
+            if let error = error {
+                self.displayErrorAlert(debugMessage: error.localizedDescription)
+                return
+            }
+            
+            guard let statusCode = (response as? HTTPURLResponse)?.statusCode else {
+                self.displayErrorAlert(debugMessage: "The request did not return a status code.")
+                return
+            }
+            
+            // The math.js API specifies that a status code of either 200 or 400 will always be returned.
+            if statusCode == 400 {
+                let invalidExpression = "The expression you entered is invalid."
+                self.displayErrorAlert(debugMessage: invalidExpression, displayMessage: invalidExpression)
+                return
+            }
+            
+            guard let data = data else {
+                self.displayErrorAlert(debugMessage: "No data was returned.")
+                return
+            }
+            
+            let result = String(decoding: data, as: UTF8.self)
+            DispatchQueue.main.async {
+                self.resultLabel.text = result
+            }
+            self.requestIsBeingMade = false
+            self.requestWasJustMade = true
+        }
+        task.resume()
+    }
+    
+}
+
+// MARK: - Extension: Helper Functions
+
+extension ViewController {
+    
+    func mathjsURL(from parameters: [String: Any]) -> URL? {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "api.mathjs.org"
+        components.path = "/v4"
+        
+        var queryItems = [URLQueryItem]()
+        for (key, value) in parameters {
+            let queryItem = URLQueryItem(name: key, value: "\(value)")
+            queryItems.append(queryItem)
+        }
+        components.queryItems = queryItems
+        
+        return components.url
+    }
+    
+    func displayErrorAlert(debugMessage: String, displayMessage: String = "There was a problem with retrieving the result.") {
+        print(debugMessage)
+        DispatchQueue.main.async {
+            let alert = UIAlertController(title: "Error", message: displayMessage, preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default, handler: { (action) in
+                self.requestIsBeingMade = false
+            }))
+            self.present(alert, animated: true, completion: nil)
+        }
+    }
+    
+    func isOperator(_ str: String) -> Bool {
+        return (str == "+" || str == "-" || str == "×" || str == "÷")
     }
     
 }
